@@ -137,6 +137,12 @@ func (c *RBApplicationFailoverController) syncBinding(ctx context.Context, bindi
 	}
 
 	if len(needEvictClusters) != 0 {
+		// Add suspension field for statefulset ResourceBinding of fail statefulset resource <- New added
+		if binding.Spec.Resource.Kind == "StatefulSet" && binding.Spec.Resource.APIVersion == "apps/v1" {
+			// Condition: Add suspension field just for resources of StatefulSet <- New added
+			binding.spec.suspension.dispatching: true
+			klog.Infof("Suspending RB %s/%s due to unhealthy StatefulSet workload in clusters: %v", binding.Namespace, binding.Name, needEvictClusters)
+		}
 		if err = c.updateBinding(ctx, binding, allClusters, needEvictClusters); err != nil {
 			return 0, err
 		}
