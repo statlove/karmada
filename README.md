@@ -1,4 +1,4 @@
-# Karmada
+# Karmada ***
 
 ![Karmada-logo](docs/images/Karmada-logo-horizontal-color.png)
 
