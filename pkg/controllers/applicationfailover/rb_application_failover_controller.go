@@ -137,12 +137,6 @@ func (c *RBApplicationFailoverController) syncBinding(ctx context.Context, bindi
 	}
 
 	if len(needEvictClusters) != 0 {
-		// Add suspension field for statefulset ResourceBinding of fail statefulset resource <- New added
-		if binding.Spec.Resource.Kind == "StatefulSet" && binding.Spec.Resource.APIVersion == "apps/v1" {
-			// Condition: Add suspension field just for resources of StatefulSet <- New added
-			binding.spec.suspension.dispatching: true
-			klog.Infof("Suspending RB %s/%s due to unhealthy StatefulSet workload in clusters: %v", binding.Namespace, binding.Name, needEvictClusters)
-		}
 		if err = c.updateBinding(ctx, binding, allClusters, needEvictClusters); err != nil {
 			return 0, err
 		}
@@ -156,6 +150,20 @@ func (c *RBApplicationFailoverController) syncBinding(ctx context.Context, bindi
 
 func (c *RBApplicationFailoverController) evictBinding(binding *workv1alpha2.ResourceBinding, clusters []string) error {
 	clustersBeforeFailover := getClusterNamesFromTargetClusters(binding.Spec.Clusters)
+        // StatefulSet인 경우 suspension 설정 추가
+        resourceKey, err := helper.ConstructClusterWideKey(binding.Spec.Resource)
+        if err == nil && resourceKey.Kind == "StatefulSet" {
+            // Suspension 필드 설정
+            if binding.Spec.Suspension == nil {
+                binding.Spec.Suspension = &workv1alpha2.BindingSuspension{
+                    Dispatching: true,
+                }
+            } else {
+                binding.Spec.Suspension.Dispatching = true
+            }
+            klog.V(4).Infof("Set suspension.dispatching=true for StatefulSet ResourceBinding %s/%s", 
+                binding.Namespace, binding.Name)
+        }
 	for _, cluster := range clusters {
 		taskOpts, err := buildTaskOptions(binding.Spec.Failover.Application, binding.Status.AggregatedStatus, cluster, RBApplicationFailoverControllerName, clustersBeforeFailover)
 		if err != nil {
