@@ -153,16 +153,15 @@ func (c *RBApplicationFailoverController) evictBinding(binding *workv1alpha2.Res
         // StatefulSet인 경우 suspension 설정 추가
         resourceKey, err := helper.ConstructClusterWideKey(binding.Spec.Resource)
         if err == nil && resourceKey.Kind == "StatefulSet" {
-            // Suspension 필드 설정
-            if binding.Spec.Suspension == nil {
-                binding.Spec.Suspension = &workv1alpha2.BindingSuspension{
-                    Dispatching: true,
-                }
-            } else {
-                binding.Spec.Suspension.Dispatching = true
+            // Create a true value for use with pointer
+            trueValue := true
+        // Suspension 필드 설정
+        if binding.Spec.Suspension == nil {
+            binding.Spec.Suspension = &workv1alpha2.Suspension{
+                Scheduling: &trueValue,
             }
-            klog.V(4).Infof("Set suspension.dispatching=true for StatefulSet ResourceBinding %s/%s", 
-                binding.Namespace, binding.Name)
+        } else {
+            binding.Spec.Suspension.Scheduling = &trueValue
         }
 	for _, cluster := range clusters {
 		taskOpts, err := buildTaskOptions(binding.Spec.Failover.Application, binding.Status.AggregatedStatus, cluster, RBApplicationFailoverControllerName, clustersBeforeFailover)
