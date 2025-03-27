@@ -158,10 +158,10 @@ func (c *RBApplicationFailoverController) evictBinding(binding *workv1alpha2.Res
         // Suspension 필드 설정
         if binding.Spec.Suspension == nil {
             binding.Spec.Suspension = &workv1alpha2.Suspension{
-                Scheduling: &trueValue,
+                Dispatching: &trueValue,
             }
         } else {
-            binding.Spec.Suspension.Scheduling = &trueValue
+            binding.Spec.Suspension.Dispatching = &trueValue
         }
 	for _, cluster := range clusters {
 		taskOpts, err := buildTaskOptions(binding.Spec.Failover.Application, binding.Status.AggregatedStatus, cluster, RBApplicationFailoverControllerName, clustersBeforeFailover)
