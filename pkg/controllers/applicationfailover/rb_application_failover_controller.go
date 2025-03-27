@@ -36,6 +36,7 @@ import (
 
 	configv1alpha1 "github.com/karmada-io/karmada/pkg/apis/config/v1alpha1"
 	workv1alpha2 "github.com/karmada-io/karmada/pkg/apis/work/v1alpha2"
+	policyv1alpha1 "github.com/karmada-io/karmada/pkg/apis/policy/v1alpha1"
 	"github.com/karmada-io/karmada/pkg/resourceinterpreter"
 	"github.com/karmada-io/karmada/pkg/sharedcli/ratelimiterflag"
 	"github.com/karmada-io/karmada/pkg/util/helper"
@@ -157,7 +158,7 @@ func (c *RBApplicationFailoverController) evictBinding(binding *workv1alpha2.Res
             trueValue := true
         // Suspension 필드 설정
         if binding.Spec.Suspension == nil {
-            binding.Spec.Suspension = &workv1alpha2.Suspension{
+            binding.Spec.Suspension = &policyv1alpha1.Suspension{
                 Dispatching: &trueValue,
             }
         } else {
