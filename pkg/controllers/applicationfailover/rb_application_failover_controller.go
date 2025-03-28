@@ -151,18 +151,23 @@ func (c *RBApplicationFailoverController) syncBinding(ctx context.Context, bindi
 
 func (c *RBApplicationFailoverController) evictBinding(binding *workv1alpha2.ResourceBinding, clusters []string) error {
 	clustersBeforeFailover := getClusterNamesFromTargetClusters(binding.Spec.Clusters)
-        // StatefulSet인 경우 suspension 설정 추가
+        // Check if the resource is a StatefulSet and add suspension setting
         resourceKey, err := helper.ConstructClusterWideKey(binding.Spec.Resource)
         if err == nil && resourceKey.Kind == "StatefulSet" {
-            // Create a true value for use with pointer
+            // Create a pointer to a boolean with value true
             trueValue := true
-        // Suspension 필드 설정
-        if binding.Spec.Suspension == nil {
-            binding.Spec.Suspension = &policyv1alpha1.Suspension{
-                Dispatching: &trueValue,
+            // Set suspension.dispatching to true
+            if binding.Spec.Suspension == nil {
+                binding.Spec.Suspension = &workv1alpha2.Suspension{
+                        Suspension: policyv1alpha1.Suspension{
+                                Dispatching: &trueValue,
+                        },
+                }
+            } else {
+                binding.Spec.Suspension.Dispatching = &trueValue
             }
-        } else {
-            binding.Spec.Suspension.Dispatching = &trueValue
+            klog.V(4).Infof("Set suspension.scheduling=true for StatefulSet ResourceBinding %s/%s",
+                binding.Namespace, binding.Name)
         }
 	for _, cluster := range clusters {
 		taskOpts, err := buildTaskOptions(binding.Spec.Failover.Application, binding.Status.AggregatedStatus, cluster, RBApplicationFailoverControllerName, clustersBeforeFailover)
