@@ -68,7 +68,8 @@ import (
 	"github.com/karmada-io/karmada/pkg/controllers/remediation"
 	"github.com/karmada-io/karmada/pkg/controllers/status"
 	"github.com/karmada-io/karmada/pkg/controllers/unifiedauth"
-	"github.com/karmada-io/karmada/pkg/controllers/workloadrebalancer"
+	"github.com/karmada-io/karmada/pkg/controllers/workloadrebalancer" 
+	"github.com/karmada-io/karmada/pkg/controllers/pvsync" //ms: add controller
 	"github.com/karmada-io/karmada/pkg/dependenciesdistributor"
 	"github.com/karmada-io/karmada/pkg/detector"
 	"github.com/karmada-io/karmada/pkg/features"
@@ -239,6 +240,8 @@ func init() {
 	controllers["remedy"] = startRemedyController
 	controllers["workloadRebalancer"] = startWorkloadRebalancerController
 	controllers["agentcsrapproving"] = startAgentCSRApprovingController
+	controllers["pvSync"] = startPVSyncController //ms: add controller
+	controllers["pvMigration"] = startPVMigrationController //ms: add controller
 }
 
 func startClusterController(ctx controllerscontext.Context) (enabled bool, err error) {
@@ -751,6 +754,34 @@ func startAgentCSRApprovingController(ctx controllerscontext.Context) (enabled b
 	return true, nil
 }
 
+//ms: add controller
+func startPVSyncController(ctx controllerscontext.Context) (enabled bool, err error) {
+	opts := ctx.Opts
+
+	controller := &pvsync.PVSyncController{
+		Client:                      ctx.Mgr.GetClient(),
+		RESTMapper:                  ctx.Mgr.GetRESTMapper(),
+		InformerManager:             genericmanager.GetInstance(),
+	        StopChan:                    ctx.StopChan,
+		PredicateFunc:               helper.NewExecutionPredicate(ctx.Mgr),
+		ClusterDynamicClientSetFunc: util.NewClusterDynamicClientSet,
+		ClusterCacheSyncTimeout:     opts.ClusterCacheSyncTimeout,
+	}
+	if err := controller.SetupWithManager(ctx.Mgr); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+func startPVMigrationController(ctx controllerscontext.Context) (enabled bool, err error) {
+    controller := &pvsync.PVMigrationController{
+        Client:        ctx.Mgr.GetClient(),
+	EventRecorder: ctx.Mgr.GetEventRecorderFor(pvsync.ControllerName),
+    }
+    if err := controller.SetupWithManager(ctx.Mgr); err != nil {
+        return false, err
+    }
+    return true, nil
+}
 // setupControllers initialize controllers and setup one by one.
 func setupControllers(mgr controllerruntime.Manager, opts *options.Options, stopChan <-chan struct{}) {
 	restConfig := mgr.GetConfig()
