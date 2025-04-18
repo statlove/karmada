@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"strings"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -49,9 +48,12 @@ func (c *PVSyncController) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	}
 	//ms: 5th modify, sts filtering
 	var sourceStsName, sourceStsNamespace string
-	var claimNamePrefixes []string
 	hasStatefulSet := false
-
+	//ms: 250418 modify, StatefulSet list get
+        statefulSets := []struct {
+                sourceStsName      string
+                sourceStsNamespace string
+        }{}
 	for _, m := range work.Spec.Workload.Manifests {
 		var obj map[string]interface{}
 		if err := json.Unmarshal(m.RawExtension.Raw, &obj); err != nil {
@@ -60,28 +62,17 @@ func (c *PVSyncController) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		if kind, ok := obj["kind"]; ok && kind == "StatefulSet" {
 			metadata := obj["metadata"].(map[string]interface{})
 			sourceStsName = metadata["name"].(string)
-			sourceStsNamespace = "default" //ms: 20250418 modify
+			sourceStsNamespace := "default" //ms: 250418 modify
 			if ns, ok := metadata["namespace"].(string); ok {
 				sourceStsNamespace = ns
 			}
-			spec := obj["spec"].(map[string]interface{})
-			vcts, ok := spec["volumeClaimTemplates"].([]interface{})
-			if !ok {
-				continue
-			}
-			for _, v := range vcts {
-				vct := v.(map[string]interface{})
-				meta := vct["metadata"].(map[string]interface{})
-				if vctName, ok := meta["name"].(string); ok {
-					prefix := fmt.Sprintf("%s-%s-", vctName, sourceStsName)
-					claimNamePrefixes = append(claimNamePrefixes, prefix)
-				}
-			}
-			//} else {
-			//	sourceStsNamespace = "default"
-			//}
-			hasStatefulSet = true
-			break
+			statefulSets = append(statefulSets, struct {
+				sourceStsName      string
+				sourceStsNamespace string
+			}{
+				sourceStsName:      sourceStsName,
+				sourceStsNamespace: sourceStsNamespace,
+			})
 		}
 	}
 	//ms: 5th modify 
@@ -122,63 +113,66 @@ func (c *PVSyncController) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		klog.Errorf("Failed to list PVs from cluster %s: %v", clusterName, err)
 		return ctrl.Result{}, err
 	}
-	
+	//ms: 250418 modify, PVC GVR setting
+	pvcGVR := corev1.SchemeGroupVersion.WithResource("persistentvolumeclaims")
 	//ms: 2nd modify, Build ConfigMap with PV metadata
-	configMap := &corev1.ConfigMap{
-		TypeMeta: metav1.TypeMeta{
-			Kind:       "ConfigMap",
-			APIVersion: "v1",
-		},
-		ObjectMeta: metav1.ObjectMeta{
-			//Name:      "pv-metadata-" + clusterName,
-			Name: fmt.Sprintf("pv-metadata-%s-%s", clusterName, sourceStsName),
-			Namespace: "default",
-		},
-		Data: map[string]string{},
-	}	
-	klog.Infof("===== PVs from cluster [%s] =====", clusterName)
-	//ms: 3rd modify, make pv configmap + 20250418 modify
-	for _, item := range pvList.Items {
-		spec, ok := item.Object["spec"]
-		if !ok {
-			continue
-		}
-		specMap, ok := spec.(map[string]interface{})
-		if !ok {
-			continue
-		}
-		claimRef, ok := specMap["claimRef"].(map[string]interface{})
-		if !ok {
-			continue
-		}
-		claimName, _ := claimRef["name"].(string)
-		claimNamespace, _ := claimRef["namespace"].(string)
-		//ms: 20250418 modify
-		if claimNamespace != sourceStsNamespace {
-			continue
-		}
-
-		matched := false
-		for _, prefix := range claimNamePrefixes {
-			if strings.HasPrefix(claimName, prefix) {
-				matched = true
-				break
+	for _, sts := range statefulSets {
+		configMap := &corev1.ConfigMap{
+			TypeMeta: metav1.TypeMeta{
+				Kind:       "ConfigMap",
+				APIVersion: "v1",
+			},
+			ObjectMeta: metav1.ObjectMeta{
+				Name: fmt.Sprintf("pv-metadata-%s-%s", clusterName, sourceStsName),
+				Namespace: "default",
+			},
+			Data: map[string]string{},
+		}	
+		klog.Infof("===== PVs from cluster [%s] =====", clusterName)
+		//ms: 3rd modify, make pv configmap + 4.17 modify
+		//expectedPrefix := fmt.Sprintf("%s-", sourceStsName)
+		for _, item := range pvList.Items {
+			spec, ok := item.Object["spec"].(map[string]interface{})
+    			if !ok {
+			        continue
 			}
-		}
-		if !matched {
-			continue
-		}
-		//if claimNamespace != sourceStsNamespace || !strings.HasPrefix(claimName, sourceStsName+"-") {
-		//	continue
-		//}
+	
+		    	claimRef, ok := spec["claimRef"].(map[string]interface{})
+    			if !ok {
+    		    		continue
+    			}
 
-		specBytes, err := yaml.Marshal(spec)
-		if err != nil {
-			klog.Warningf("Failed to marshal PV spec for %s: %v", item.GetName(), err)
-			continue
-		}
-		configMap.Data[item.GetName()] = string(specBytes)
+    			pvcName, _ := claimRef["name"].(string)
+    			pvcNamespace, _ := claimRef["namespace"].(string)
+
+    			// ✅ StatefulSet이 소유한 PVC인지 확인
+    			//if pvcNamespace != sourceStsNamespace || !strings.HasPrefix(pvcName, expectedPrefix) {
+        		//	continue
+    			//}
+			// 5. PVC를 동적으로 조회하여 ownerReference 확인
+			pvcRes, err := dynamicClient.DynamicClientSet.Resource(pvcGVR).Namespace(pvcNamespace).Get(ctx, pvcName, metav1.GetOptions{})
+			if err != nil {
+				klog.Warningf("Failed to get PVC %s/%s: %v", pvcNamespace, pvcName, err)
+				continue
+			}
+			found := false
+			for _, o := range pvcRes.GetOwnerReferences() {
+				if o.Kind == "StatefulSet" && o.Name == sts.sourceStsName {
+					found = true
+					break
+				}
+			}
+			if !found {
+				continue
+			}
+    			specBytes, err := yaml.Marshal(spec)
+ 	   		if err != nil {
+        			continue
+    			}
+
+    			configMap.Data[item.GetName()] = string(specBytes)
 		//pvName := item.GetName()
+
 		//spec, ok := item.Object["spec"]
 		//if !ok {
 		//	continue
@@ -189,55 +183,56 @@ func (c *PVSyncController) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		//	continue
 		//}
 		//configMap.Data[pvName] = string(specBytes)
-	}
-	//ms: 6th modify 
-	if len(configMap.Data) == 0 {
-		klog.Infof("No valid PVs found in cluster %s. Skipping PV metadata Work creation.", clusterName)
-		return ctrl.Result{}, nil
-	}
-	//ms: 2nd modify
-	rawObj, err := json.Marshal(configMap)
-	if err != nil {
-		return ctrl.Result{}, err
-	}
-
-	manifest := workv1alpha1.Manifest{
-		RawExtension: runtime.RawExtension{
-			Raw: rawObj,
-		},
-	}	
-	//ms: 2nd modify, Create Work with manifest
-	//workName := "pv-metadata-" + clusterName
-	workName := fmt.Sprintf("pv-metadata-%s-%s", clusterName, sourceStsName) //ms: 20250418 modify
-	execNamespace := names.GenerateExecutionSpaceName(clusterName)
-	//ms: 5th modify, add label of owner sts
-	metaWork := &workv1alpha1.Work{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      workName,
-			Namespace: execNamespace,
-			Labels: map[string]string{
-				"pvsync.karmada.io/type":        "metadata",
-				"pvsync.karmada.io/source-sts":  fmt.Sprintf("%s.%s", sourceStsNamespace, sourceStsName),
-				"pvsync.karmada.io/source-work": work.Name,
-			},
-		},
-	}
-	_, err = controllerutil.CreateOrUpdate(ctx, c.Client, metaWork, func() error {
-		//ms: 4th modify, work suspension setting
-		suspend := true
-		metaWork.Spec.SuspendDispatching = &suspend
-
-		metaWork.Spec.Workload = workv1alpha1.WorkloadTemplate{
-			Manifests: []workv1alpha1.Manifest{manifest},
 		}
-		return nil
-	})
-	if err != nil {
-		klog.Errorf("Failed to create or update PV metadata Work for cluster %s: %v", clusterName, err)
-		return ctrl.Result{}, err
+		//ms: 6th modify 
+		if len(configMap.Data) == 0 {
+			klog.Infof("No valid PVs found in cluster %s. Skipping PV metadata Work creation.", clusterName)
+			return ctrl.Result{}, nil
+		}
+		//ms: 2nd modify
+		rawObj, err := json.Marshal(configMap)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+	
+		manifest := workv1alpha1.Manifest{
+			RawExtension: runtime.RawExtension{
+				Raw: rawObj,
+			},
+		}	
+		//ms: 2nd modify, Create Work with manifest
+		//workName := "pv-metadata-" + clusterName
+		workName := fmt.Sprintf("pv-metadata-%s-%s", clusterName, sourceStsName)
+		execNamespace := names.GenerateExecutionSpaceName(clusterName)
+		//ms: 5th modify, add label of owner sts
+		metaWork := &workv1alpha1.Work{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      workName,
+				Namespace: execNamespace,
+				Labels: map[string]string{
+					"pvsync.karmada.io/type":        "metadata",
+					"pvsync.karmada.io/source-sts":  fmt.Sprintf("%s.%s", sourceStsNamespace, sourceStsName),
+					"pvsync.karmada.io/source-work": work.Name,
+				},
+			},
+		}
+		_, err = controllerutil.CreateOrUpdate(ctx, c.Client, metaWork, func() error {
+			//ms: 4th modify, work suspension setting
+			suspend := true
+			metaWork.Spec.SuspendDispatching = &suspend
+	
+			metaWork.Spec.Workload = workv1alpha1.WorkloadTemplate{
+				Manifests: []workv1alpha1.Manifest{manifest},
+			}
+			return nil
+		})
+		if err != nil {
+			klog.Errorf("Failed to create or update PV metadata Work for cluster %s: %v", clusterName, err)
+			return ctrl.Result{}, err
+		}
+	
+		klog.Infof("Created/Updated PV metadata Work for cluster %s and sts %s", clusterName, sourceStsName)
 	}
-
-	klog.Infof("Created/Updated PV metadata Work for cluster %s", clusterName)
 	return ctrl.Result{}, nil
 }
 

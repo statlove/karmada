@@ -97,6 +97,13 @@ func (c *PVMigrationController) Reconcile(ctx context.Context, req ctrl.Request)
 		// 9. View PV-metadata work configmap
 		for _, cluster := range newClusters {
 			for _, w := range workList.Items {
+				//ms: 4/17 modify.Check only the Work matching current cluster
+				labelValue := w.Labels["pvsync.karmada.io/source-sts"]
+    				expected := fmt.Sprintf("%s.%s", rb.Spec.Resource.Namespace, rb.Spec.Resource.Name)
+				if labelValue != expected {
+        				klog.Infof("⛔ Skipping unrelated PV metadata Work: %s (label: %s)", w.Name, labelValue)
+        				continue
+			    	}
 				for _, manifest := range w.Spec.Workload.Manifests {
 					var u unstructured.Unstructured
 					if err := yaml.Unmarshal(manifest.Raw, &u); err != nil {
@@ -180,7 +187,7 @@ func (c *PVMigrationController) createPVWork(ctx context.Context, clusterName st
     		},	
 	}
 	//ms: if pv work existed, skip
-	workName := fmt.Sprintf("pv-work-%s-%s", rb.Name, clusterName)
+	workName := fmt.Sprintf("pv-work-%s-%s-%s", rb.Name, clusterName,pvName) //ms: modify work name
 	workNamespace := names.GenerateExecutionSpaceName(clusterName)
 	existing := &workv1alpha1.Work{}
 	if err := c.Client.Get(ctx, client.ObjectKey{
@@ -191,7 +198,7 @@ func (c *PVMigrationController) createPVWork(ctx context.Context, clusterName st
 		return nil
 	}
 	//ms: create pv name
-	generatedName := fmt.Sprintf("pv-%s-%s", rb.Name, clusterName)
+	generatedName := fmt.Sprintf("pv-%s-%s-%s", rb.Name, clusterName, pvName)
 	var existingPVs corev1.PersistentVolumeList
 	if err := c.Client.List(ctx, &existingPVs); err == nil {
 		for _, existingPV := range existingPVs.Items {
@@ -222,12 +229,13 @@ func (c *PVMigrationController) createPVWork(ctx context.Context, clusterName st
 	}
 
 	workMeta := metav1.ObjectMeta{
-		Name:      fmt.Sprintf("pv-work-%s-%s", rb.Name, clusterName),
+		Name:      fmt.Sprintf("pv-work-%s-%s-%s", rb.Name, clusterName, pvName),
 		Namespace: names.GenerateExecutionSpaceName(clusterName),
 		Labels: map[string]string{
 			"pvsync.karmada.io/type":       "pv-deployment",
 			"pvsync.karmada.io/source-sts": rb.Spec.Resource.Namespace + "." + rb.Spec.Resource.Name,
 			"pvsync.karmada.io/source-rb":  rb.Name,
+			"pvsync.karmada.io/source-pv":  pvName,
 		},
 	}
 
@@ -251,7 +259,10 @@ func (c *PVMigrationController) cleanupAfterBoundPV(ctx context.Context,rb *work
 	const (
 		maxRetries    = 10
 		retryInterval = 2 * time.Second
-	)	
+	)
+	availableCount := 0
+	expectedCount := len(pvWorkList.Items)
+
 	for _, pvWork := range pvWorkList.Items {
 		klog.Infof("🔍 Checking PV Work: %s/%s", pvWork.Namespace, pvWork.Name)
 
@@ -288,30 +299,32 @@ func (c *PVMigrationController) cleanupAfterBoundPV(ctx context.Context,rb *work
 			}
 			time.Sleep(retryInterval)
 		}
-
-		if !isAvailable {
+		if isAvailable {
+			availableCount++
+		} else {
 			klog.Warningf("⏳ PV Work %s/%s not ready after retries, skipping cleanup", pvWork.Namespace, pvWork.Name)
-			continue
 		}
 
 		// ✅11.1. suspension delete first
-		if rb.Spec.Suspension != nil && rb.Spec.Suspension.Dispatching != nil && *rb.Spec.Suspension.Dispatching {
-			freshRB := &workv1alpha2.ResourceBinding{}
-			if err := c.Client.Get(ctx, client.ObjectKeyFromObject(rb), freshRB); err != nil {
-				klog.Errorf("❌ Failed to get fresh ResourceBinding: %v", err)
-				return err
-			}
-			if freshRB.Spec.Suspension == nil {
-				freshRB.Spec.Suspension = &workv1alpha2.Suspension{}
-			}
-			falseVal := false
-			freshRB.Spec.Suspension.Dispatching = &falseVal
-
-			if err := c.Client.Update(ctx, freshRB); err != nil {
-				klog.Warningf("❌ Still failed to update suspension.dispatching: %v", err)
-				return err
-			} else {
-				klog.Infof("✅ Successfully updated suspension.dispatching to false")
+		if availableCount == expectedCount {
+			if rb.Spec.Suspension != nil && rb.Spec.Suspension.Dispatching != nil && *rb.Spec.Suspension.Dispatching {
+				freshRB := &workv1alpha2.ResourceBinding{}
+				if err := c.Client.Get(ctx, client.ObjectKeyFromObject(rb), freshRB); err != nil {
+					klog.Errorf("❌ Failed to get fresh ResourceBinding: %v", err)
+					return err
+				}
+				if freshRB.Spec.Suspension == nil {
+					freshRB.Spec.Suspension = &workv1alpha2.Suspension{}
+				}
+				falseVal := false
+				freshRB.Spec.Suspension.Dispatching = &falseVal
+	
+				if err := c.Client.Update(ctx, freshRB); err != nil {
+					klog.Warningf("❌ Still failed to update suspension.dispatching: %v", err)
+					return err
+				} else {
+					klog.Infof("✅ Successfully updated suspension.dispatching to false")
+				}
 			}
 		}
 		// ✅ 11.2. PV Work delete
