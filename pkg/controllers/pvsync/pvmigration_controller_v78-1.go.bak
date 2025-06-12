@@ -2,7 +2,6 @@ package pvsync
 import (
 	"context"
 	"fmt"
-	"sync"
 	"time"
 	"encoding/json"
 	"crypto/sha1"
@@ -12,7 +11,6 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/client-go/tools/record"
-	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"k8s.io/klog/v2"
@@ -223,77 +221,67 @@ func (c *PVMigrationController) createPVWork(ctx context.Context, clusterName st
 	klog.Infof("✅ Created PV Work %s for cluster %s using PV %s", workName, clusterName, newPV.Name)
 	return nil
 }
-func (c *PVMigrationController) finalizeFailoverIfReady(ctx context.Context, rb *workv1alpha2.ResourceBinding) error {
-	const retryInterval = 1 * time.Second
-
-	for {
-		pvWorkList := &workv1alpha1.WorkList{}
-		if err := c.Client.List(ctx, pvWorkList, client.MatchingLabels{
-			"pvsync.karmada.io/type":      "pv-deployment",
-			"pvsync.karmada.io/source-rb": rb.Name,
-		}); err != nil {
-			return fmt.Errorf("failed to list PV Works: %w", err)
-		}
-
-		expectedCount := len(pvWorkList.Items)
-		if expectedCount == 0 {
-			klog.Infof("🚫 No PV Works found for RB %s/%s. Skipping suspension finalize.", rb.Namespace, rb.Name)
-			return nil
-		}
-
-		var availableCount int
-		var mu sync.Mutex
-		var wg sync.WaitGroup
-
-		for _, pvWork := range pvWorkList.Items {
-			wg.Add(1)
-			go func(pvWork workv1alpha1.Work) {
-				defer wg.Done()
-
-				klog.Infof("🔍 Checking PV Work: %s/%s", pvWork.Namespace, pvWork.Name)
-
-				latest := &workv1alpha1.Work{}
-				if err := c.Client.Get(ctx, client.ObjectKeyFromObject(&pvWork), latest); err != nil {
-					klog.Warningf("⚠️ Failed to re-fetch PV Work %s: %v", pvWork.Name, err)
-					return
-				}
-
-				for _, m := range latest.Status.ManifestStatuses {
-					if m.Identifier.Kind != "PersistentVolume" || m.Health != "Healthy" {
-						continue
-					}
-					var phaseStruct struct {
-						Phase string `json:"phase"`
-					}
-					if err := json.Unmarshal(m.Status.Raw, &phaseStruct); err != nil {
-						klog.Warningf("⚠️ Failed to parse phase for %s: %v", m.Identifier.Name, err)
-						continue
-					}
-					klog.Infof("➡️  PV %s phase = %s", m.Identifier.Name, phaseStruct.Phase)
-					if phaseStruct.Phase == "Available" || phaseStruct.Phase == "Bound" {
-						mu.Lock()
-						availableCount++
-						mu.Unlock()
-						break
-					}
-				}
-			}(pvWork)
-		}
-
-		wg.Wait()
-
-		klog.Infof("✅ Available PVs: %d / %d", availableCount, expectedCount)
-
-		if availableCount == expectedCount {
-			break
-		}
-
-		time.Sleep(retryInterval)
+func (c *PVMigrationController) finalizeFailoverIfReady(ctx context.Context, rb *workv1alpha2.ResourceBinding,) error {
+	// 1. PV Work 목록 조회
+	pvWorkList := &workv1alpha1.WorkList{}
+	if err := c.Client.List(ctx, pvWorkList, client.MatchingLabels{
+		"pvsync.karmada.io/type":      "pv-deployment",
+		"pvsync.karmada.io/source-rb": rb.Name,
+	}); err != nil {
+		return fmt.Errorf("failed to list PV Works: %w", err)
 	}
 
-	// ✅ 모든 PV 준비 완료 후 suspension 해제
-	if rb.Spec.Suspension != nil && rb.Spec.Suspension.Dispatching != nil && *rb.Spec.Suspension.Dispatching {
-		err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+	// 2. 모든 PV Work가 Available 상태인지 확인
+	const (
+		maxRetries    = 1
+		retryInterval = 1 * time.Second
+	)
+	availableCount := 0
+	expectedCount := len(pvWorkList.Items)
+	if expectedCount == 0 {
+		klog.Infof("🚫 No PV Works found for RB %s/%s. Skipping suspension finalize.", rb.Namespace, rb.Name)
+		return nil
+	}
+	for _, pvWork := range pvWorkList.Items {
+		klog.Infof("🔍 Checking PV Work: %s/%s", pvWork.Namespace, pvWork.Name)
+		isAvailable := false
+
+		for i := 0; i < maxRetries; i++ {
+			latest := &workv1alpha1.Work{}
+			if err := c.Client.Get(ctx, client.ObjectKeyFromObject(&pvWork), latest); err != nil {
+				klog.Warningf("Failed to re-fetch PV Work: %v", err)
+				break
+			}
+
+			for _, m := range latest.Status.ManifestStatuses {
+				if m.Identifier.Kind != "PersistentVolume" || m.Health != "Healthy" {
+					continue
+				}
+				var phaseStruct struct {
+					Phase string `json:"phase"`
+				}
+				if err := json.Unmarshal(m.Status.Raw, &phaseStruct); err != nil {
+					klog.Warningf("Failed to parse status.phase: %v", err)
+					continue
+				}
+				klog.Infof("Retry %d: phase = %s", i+1, phaseStruct.Phase)
+				if phaseStruct.Phase == "Available" || phaseStruct.Phase == "Bound" {
+					isAvailable = true
+					break
+				}
+			}
+			time.Sleep(retryInterval)
+		}
+		if isAvailable {
+			availableCount++
+		} else {
+			klog.Warningf("⏳ PV Work %s/%s not ready after retries", pvWork.Namespace, pvWork.Name)
+		}
+	}
+
+	// 3. 모든 PV가 준비되었으면 suspension 해제
+	if availableCount == expectedCount {
+		if rb.Spec.Suspension != nil && rb.Spec.Suspension.Dispatching != nil && *rb.Spec.Suspension.Dispatching {
 			freshRB := &workv1alpha2.ResourceBinding{}
 			if err := c.Client.Get(ctx, client.ObjectKeyFromObject(rb), freshRB); err != nil {
 				klog.Errorf("❌ Failed to get fresh ResourceBinding: %v", err)
@@ -308,25 +296,17 @@ func (c *PVMigrationController) finalizeFailoverIfReady(ctx context.Context, rb 
 				klog.Warningf("❌ Failed to update suspension.dispatching: %v", err)
 				return err
 			}
-			return nil
-		})
-		if err != nil {
-			klog.Warningf("❌ Still failed to update suspension.dispatching after retries: %v", err)
-			return err
+			klog.Infof("✅ Successfully updated suspension.dispatching to false")
 		}
-		klog.Infof("🎯 Successfully updated suspension.dispatching to false after all PVs became ready")
 	}
-
 	return nil
 }
-
 func (c *PVMigrationController) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		Named(PVMigrationControllerName).
 		For(&workv1alpha2.ResourceBinding{}). // no predicate, triggers on create/update
 		Complete(c)
 }
-
 
 
 

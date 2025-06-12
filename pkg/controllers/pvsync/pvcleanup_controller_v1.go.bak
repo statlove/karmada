@@ -1,0 +1,134 @@
+package pvsync
+
+import (
+	"context"
+	"fmt"
+
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	workv1alpha1 "github.com/karmada-io/karmada/pkg/apis/work/v1alpha1"
+	workv1alpha2 "github.com/karmada-io/karmada/pkg/apis/work/v1alpha2"
+	"github.com/karmada-io/karmada/pkg/util"
+	"github.com/karmada-io/karmada/pkg/util/names"
+
+	"k8s.io/klog/v2"
+)
+
+type CleanupController struct {
+	client.Client
+	ClusterDynamicClientSetFunc func(clusterName string, client client.Client) (*util.DynamicClusterClient, error)
+	RESTMapper                  meta.RESTMapper
+}
+
+func (c *CleanupController) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+	rb := &workv1alpha2.ResourceBinding{}
+	if err := c.Client.Get(ctx, req.NamespacedName, rb); err != nil {
+		return ctrl.Result{}, client.IgnoreNotFound(err)
+	}
+
+	// 1. 조건 확인
+	if rb.Spec.Resource.Kind != "StatefulSet" {
+		return ctrl.Result{}, nil
+	}
+	if len(rb.Spec.GracefulEvictionTasks) > 0 {
+		return ctrl.Result{}, nil
+	}
+	if rb.Spec.Suspension != nil && rb.Spec.Suspension.Dispatching != nil && *rb.Spec.Suspension.Dispatching {
+		return ctrl.Result{}, nil
+	}
+
+	stsKey := fmt.Sprintf("%s.%s", rb.Spec.Resource.Namespace, rb.Spec.Resource.Name)
+
+	// 2. 현재 스케줄된 클러스터
+	currentClusters := map[string]bool{}
+	for _, c := range rb.Spec.Clusters {
+		currentClusters[c.Name] = true
+	}
+
+	// 3. Work 조회
+	workList := &workv1alpha1.WorkList{}
+	if err := c.Client.List(ctx, workList, client.MatchingLabels{
+		"pvsync.karmada.io/source-sts": stsKey,
+	}); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	for _, w := range workList.Items {
+		clusterName, err := names.GetClusterName(w.Namespace)
+		if err != nil {
+			continue
+		}
+		isPVWork := w.Labels["pvsync.karmada.io/type"] == "pv-deployment"
+		isMetaWork := w.Labels["pvsync.karmada.io/type"] == "metadata"
+
+		shouldDelete := false
+		if !currentClusters[clusterName] {
+			shouldDelete = true // 이전 클러스터 → 삭제 대상
+		} else if isPVWork {
+			shouldDelete = true // 현재 클러스터 내 PV Work도 삭제
+		}
+
+		if shouldDelete {
+			klog.Infof("🧹 Deleting Work %s in cluster %s", w.Name, clusterName)
+			_ = c.Client.Delete(ctx, &w)
+		}
+
+		// 4. 해당 클러스터 내 PVC/PV 삭제 (pv-work라면)
+		if isPVWork {
+			dc, err := c.ClusterDynamicClientSetFunc(clusterName, c.Client)
+			if err != nil {
+				klog.Warningf("❌ Failed to create dynamic client for %s: %v", clusterName, err)
+				continue
+			}
+			// Config에서 PV name, PVC name 추출
+			sourcePV := w.Labels["pvsync.karmada.io/source-pv"]
+			if sourcePV == "" {
+				continue
+			}
+			claimRef := extractClaimRef(w) // 아래 함수 정의 참고
+
+			// PVC 삭제
+			if claimRef != nil {
+				err := dc.KubeClient.CoreV1().PersistentVolumeClaims(claimRef.Namespace).Delete(ctx, claimRef.Name, metav1.DeleteOptions{})
+				if err == nil {
+					klog.Infof("✅ Deleted PVC %s/%s in cluster %s", claimRef.Namespace, claimRef.Name, clusterName)
+				}
+			}
+
+			// PV 삭제
+			err = dc.KubeClient.CoreV1().PersistentVolumes().Delete(ctx, sourcePV, metav1.DeleteOptions{})
+			if err == nil {
+				klog.Infof("✅ Deleted PV %s in cluster %s", sourcePV, clusterName)
+			}
+		}
+	}
+	return ctrl.Result{}, nil
+}
+
+func extractClaimRef(work *workv1alpha1.Work) *corev1.ObjectReference {
+	for _, m := range work.Spec.Workload.Manifests {
+		if m.Raw == nil {
+			continue
+		}
+		var pv corev1.PersistentVolume
+		if err := util.UnmarshalRawExtensionToObject(m.RawExtension, &pv); err != nil {
+			continue
+		}
+		if pv.Spec.ClaimRef != nil {
+			return pv.Spec.ClaimRef
+		}
+	}
+	return nil
+}
+
+func (c *CleanupController) SetupWithManager(mgr ctrl.Manager) error {
+	return ctrl.NewControllerManagedBy(mgr).
+		Named("pv-cleanup-controller").
+		For(&workv1alpha2.ResourceBinding{}).
+		Complete(c)
+}
+

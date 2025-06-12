@@ -358,6 +358,16 @@ type ApplicationFailoverBehavior struct {
 	// which is alpha.
 	// +optional
 	StatePreservation *StatePreservation `json:"statePreservation,omitempty"`
+
+	// CleanupOutdatedPV defines the policy for after task of PV migration.
+	// After PV migrate from one cluster to another cluster, PV and PVC in privious
+	// cluster remain and not be deleted.
+	// But the reason why we set this feature as optional is for some users who want 
+	// to remain PV of previous one when they want to remigrate resources when privious
+	// cluster recovers from error.(Restore)
+	// ms: 20250430 added.
+	// +optional
+	// CleanupOutdatedPV bool `json:"cleanupOutdatedPV,omitempty"`
 }
 
 // DecisionConditions represents the decision conditions of performing the failover process.

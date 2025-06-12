@@ -153,24 +153,20 @@ func (c *RBApplicationFailoverController) evictBinding(binding *workv1alpha2.Res
 	clustersBeforeFailover := getClusterNamesFromTargetClusters(binding.Spec.Clusters)
 	// Check if the resource is a StatefulSet and add suspension setting
         resourceKey, err := helper.ConstructClusterWideKey(binding.Spec.Resource)
-        if err == nil && resourceKey.Kind == "StatefulSet" {
-            // Create a pointer to a boolean with value true
-            trueValue := true
-        
-            // Set suspension.dispatching to true
-            if binding.Spec.Suspension == nil {
-                binding.Spec.Suspension = &workv1alpha2.Suspension{
-			Suspension: policyv1alpha1.Suspension{
-				Dispatching: &trueValue,
-                	},
+	if err == nil && resourceKey.Kind == "StatefulSet" {
+		// Create a pointer to a boolean with value true
+		trueValue := true
+		if binding.Spec.Suspension == nil {
+			binding.Spec.Suspension = &workv1alpha2.Suspension{
+				Suspension: policyv1alpha1.Suspension{
+					Dispatching: &trueValue,
+				},
+			}
+			klog.V(4).Infof("Set suspension.scheduling=true for StatefulSet ResourceBinding %s/%s (new Suspension block)", binding.Namespace, binding.Name)
+		} else {
+			binding.Spec.Suspension.Dispatching = &trueValue
 		}
-            } else {
-                binding.Spec.Suspension.Dispatching = &trueValue
-            }
-        
-            klog.V(4).Infof("Set suspension.scheduling=true for StatefulSet ResourceBinding %s/%s", 
-                binding.Namespace, binding.Name)
-        }
+	}
 	for _, cluster := range clusters {
 		taskOpts, err := buildTaskOptions(binding.Spec.Failover.Application, binding.Status.AggregatedStatus, cluster, RBApplicationFailoverControllerName, clustersBeforeFailover)
 		if err != nil {

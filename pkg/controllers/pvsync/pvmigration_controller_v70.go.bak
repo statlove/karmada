@@ -2,7 +2,6 @@ package pvsync
 import (
 	"context"
 	"fmt"
-	"sync"
 	"time"
 	"encoding/json"
 	"crypto/sha1"
@@ -11,18 +10,18 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/tools/record"
-	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"k8s.io/klog/v2"
 	"sigs.k8s.io/yaml"
 	workv1alpha1 "github.com/karmada-io/karmada/pkg/apis/work/v1alpha1"
 	workv1alpha2 "github.com/karmada-io/karmada/pkg/apis/work/v1alpha2"
+	"github.com/karmada-io/karmada/pkg/util"
 	"github.com/karmada-io/karmada/pkg/util/helper"
 	"github.com/karmada-io/karmada/pkg/util/names"
 	"github.com/karmada-io/karmada/pkg/controllers/ctrlutil"
-
 )
 const PVMigrationControllerName = "pv-migration-controller"
 type PVMigrationController struct {
@@ -32,7 +31,6 @@ type PVMigrationController struct {
 }
 func (c *PVMigrationController) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	klog.Infof("[PVMigrationController] Reconciling ResourceBinding")
-
 	rb := &workv1alpha2.ResourceBinding{}
 	if err := c.Client.Get(ctx, req.NamespacedName, rb); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
@@ -56,7 +54,7 @@ func (c *PVMigrationController) Reconcile(ctx context.Context, req ctrl.Request)
 	if rb.Spec.Suspension != nil && rb.Spec.Suspension.Dispatching != nil && *rb.Spec.Suspension.Dispatching {
 		klog.Infof("[Matched RB] %s/%s: Unhealthy StatefulSet, dispatching suspended", rb.Namespace, rb.Name)
 	}
-	// 4. Build source StatefulSet key
+		// 4. Build source StatefulSet key
 	stsKey := rb.Spec.Resource.Namespace + "." + rb.Spec.Resource.Name
 	// 5. Get PV metadata Works created by PVSyncController
 	workList := &workv1alpha1.WorkList{}
@@ -81,6 +79,7 @@ func (c *PVMigrationController) Reconcile(ctx context.Context, req ctrl.Request)
 		}
 		metaWorkClusterSet[clusterName] = true
 	}
+	// 8. 
 	for cluster := range currentClusterSet {
 		hasPV := false
 		for _, w := range workList.Items {
@@ -125,8 +124,25 @@ func (c *PVMigrationController) Reconcile(ctx context.Context, req ctrl.Request)
 			}
 		}
 	}
-	if err := c.finalizeFailoverIfReady(ctx, rb); err != nil {
-		klog.Errorf("❌ Failed to finalize failover for %s/%s: %v", rb.Namespace, rb.Name, err)
+	_ = c.cleanupAfterBoundPV(ctx, rb, workList, currentClusterSet)
+
+	//11. If PV deploy successfully, delete previous metadata work and PV work
+	if rb.Spec.GracefulEvictionTasks == nil && len(rb.Spec.GracefulEvictionTasks) == 0 {
+		// ✅ 조건이 없어진 시점 → cleanup 수행
+		for _, work := range workList.Items {
+			metaCluster, err := names.GetClusterName(work.Namespace)
+			if err != nil {
+				continue
+			}
+			if currentClusterSet[metaCluster] {
+				continue
+			}
+			klog.Infof("🚀 Proceeding with orphan PV/PVC cleanup in cluster %s", metaCluster)
+			
+			_ = c.cleanupOrphanPVs(ctx, metaCluster, &work)
+		}
+	} else {
+		klog.Infof("⏳ GracefulEvictionTasks still present. Requeueing for later check.")
 	}
 	return ctrl.Result{}, nil
 }
@@ -163,7 +179,7 @@ func (c *PVMigrationController) createPVWork(ctx context.Context, clusterName st
     		},	
 	}
 	//ms: if pv work existed, skip
-	workName := fmt.Sprintf("pv-work-%s-%s-%s", rb.Name, shortHash(pvName), clusterName) //ms: modify work name
+	workName := fmt.Sprintf("pv-work-%s-%s", rb.Name, clusterName) //ms: modify work name
 	workNamespace := names.GenerateExecutionSpaceName(clusterName)
 	existing := &workv1alpha1.Work{}
 	if err := c.Client.Get(ctx, client.ObjectKey{
@@ -223,111 +239,165 @@ func (c *PVMigrationController) createPVWork(ctx context.Context, clusterName st
 	klog.Infof("✅ Created PV Work %s for cluster %s using PV %s", workName, clusterName, newPV.Name)
 	return nil
 }
-func (c *PVMigrationController) finalizeFailoverIfReady(ctx context.Context, rb *workv1alpha2.ResourceBinding) error {
-	const retryInterval = 1 * time.Second
-
-	for {
-		pvWorkList := &workv1alpha1.WorkList{}
-		if err := c.Client.List(ctx, pvWorkList, client.MatchingLabels{
-			"pvsync.karmada.io/type":      "pv-deployment",
-			"pvsync.karmada.io/source-rb": rb.Name,
-		}); err != nil {
-			return fmt.Errorf("failed to list PV Works: %w", err)
-		}
-
-		expectedCount := len(pvWorkList.Items)
-		if expectedCount == 0 {
-			klog.Infof("🚫 No PV Works found for RB %s/%s. Skipping suspension finalize.", rb.Namespace, rb.Name)
-			return nil
-		}
-
-		var availableCount int
-		var mu sync.Mutex
-		var wg sync.WaitGroup
-
-		for _, pvWork := range pvWorkList.Items {
-			wg.Add(1)
-			go func(pvWork workv1alpha1.Work) {
-				defer wg.Done()
-
-				klog.Infof("🔍 Checking PV Work: %s/%s", pvWork.Namespace, pvWork.Name)
-
-				latest := &workv1alpha1.Work{}
-				if err := c.Client.Get(ctx, client.ObjectKeyFromObject(&pvWork), latest); err != nil {
-					klog.Warningf("⚠️ Failed to re-fetch PV Work %s: %v", pvWork.Name, err)
-					return
+func (c *PVMigrationController) cleanupAfterBoundPV(ctx context.Context,rb *workv1alpha2.ResourceBinding,workList *workv1alpha1.WorkList,currentClusterSet map[string]bool,) error {
+	klog.Infof("cleanup start")
+	pvWorkList := &workv1alpha1.WorkList{}
+	if err := c.Client.List(ctx, pvWorkList, client.MatchingLabels{
+		"pvsync.karmada.io/type":      "pv-deployment",
+		"pvsync.karmada.io/source-rb": rb.Name,
+	}); err != nil {
+		return fmt.Errorf("failed to list PV Works: %w", err)
+	}
+	const (
+		maxRetries    = 10
+		retryInterval = 2 * time.Second
+	)
+	availableCount := 0
+	expectedCount := len(pvWorkList.Items)
+	for _, pvWork := range pvWorkList.Items {
+		klog.Infof("🔍 Checking PV Work: %s/%s", pvWork.Namespace, pvWork.Name)
+		isAvailable := false
+		for i := 0; i < maxRetries; i++ {
+			// 최신 상태 가져오기
+			latest := &workv1alpha1.Work{}
+			if err := c.Client.Get(ctx, client.ObjectKeyFromObject(&pvWork), latest); err != nil {
+				klog.Warningf("Failed to re-fetch PV Work: %v", err)
+				break
+			}
+			for _, m := range latest.Status.ManifestStatuses {
+				if m.Identifier.Kind != "PersistentVolume" || m.Health != "Healthy" {
+					continue
 				}
-
-				for _, m := range latest.Status.ManifestStatuses {
-					if m.Identifier.Kind != "PersistentVolume" || m.Health != "Healthy" {
-						continue
-					}
-					var phaseStruct struct {
-						Phase string `json:"phase"`
-					}
-					if err := json.Unmarshal(m.Status.Raw, &phaseStruct); err != nil {
-						klog.Warningf("⚠️ Failed to parse phase for %s: %v", m.Identifier.Name, err)
-						continue
-					}
-					klog.Infof("➡️  PV %s phase = %s", m.Identifier.Name, phaseStruct.Phase)
-					if phaseStruct.Phase == "Available" || phaseStruct.Phase == "Bound" {
-						mu.Lock()
-						availableCount++
-						mu.Unlock()
-						break
-					}
+				var phaseStruct struct {
+					Phase string `json:"phase"`
 				}
-			}(pvWork)
+				if err := json.Unmarshal(m.Status.Raw, &phaseStruct); err != nil {
+					klog.Warningf("Failed to parse status.phase: %v", err)
+					continue
+				}
+				klog.Infof("Retry %d: phase = %s", i+1, phaseStruct.Phase)
+				if phaseStruct.Phase == "Available"|| phaseStruct.Phase == "Bound" {
+					isAvailable = true
+					break
+				}
+			}
+			if isAvailable {
+				break
+			}
+			time.Sleep(retryInterval)
 		}
-
-		wg.Wait()
-
-		klog.Infof("✅ Available PVs: %d / %d", availableCount, expectedCount)
-
+		if isAvailable {
+			availableCount++
+		} else {
+			klog.Warningf("⏳ PV Work %s/%s not ready after retries, skipping cleanup", pvWork.Namespace, pvWork.Name)
+		}
+		// ✅11.1. suspension delete first
 		if availableCount == expectedCount {
-			break
+			if rb.Spec.Suspension != nil && rb.Spec.Suspension.Dispatching != nil && *rb.Spec.Suspension.Dispatching {
+				freshRB := &workv1alpha2.ResourceBinding{}
+				if err := c.Client.Get(ctx, client.ObjectKeyFromObject(rb), freshRB); err != nil {
+					klog.Errorf("❌ Failed to get fresh ResourceBinding: %v", err)
+					return err
+				}
+				if freshRB.Spec.Suspension == nil {
+					freshRB.Spec.Suspension = &workv1alpha2.Suspension{}
+				}
+				falseVal := false
+				freshRB.Spec.Suspension.Dispatching = &falseVal
+					if err := c.Client.Update(ctx, freshRB); err != nil {
+					klog.Warningf("❌ Still failed to update suspension.dispatching: %v", err)
+					return err
+				} else {
+					klog.Infof("✅ Successfully updated suspension.dispatching to false")
+				}
+			}
 		}
+		// ✅ 11.2. PV Work delete
+		if err := c.Client.Delete(ctx, &pvWork); err != nil {
+			klog.Warningf("Failed to delete PV Work %s: %v", pvWork.Name, err)
+		} else {
+			klog.Infof("🧹 Deleted PV Work %s", pvWork.Name)
+		}
+		// ✅ 11.3. PV metadata Work delete(except now deployed pv metadata work)
+		for _, w := range workList.Items {
+			metaCluster, err := names.GetClusterName(w.Namespace)
+			if err != nil {
+				continue
+			}
+			if !currentClusterSet[metaCluster] {
+				if err := c.Client.Delete(ctx, &w); err != nil {
+					klog.Warningf("Failed to delete outdated metadata Work from %s: %v", metaCluster, err)
+				} else {
+					klog.Infof("🧹 Deleted outdated PV metadata Work from %s", metaCluster)
+				}
+			}
+		}
+	}
+	return nil
+}
+func (c *PVMigrationController) cleanupOrphanPVs(ctx context.Context, cluster string, work *workv1alpha1.Work,) error {
+	for _, manifest := range work.Spec.Workload.Manifests {
+		var cm corev1.ConfigMap
+		if err := yaml.Unmarshal(manifest.Raw, &cm); err != nil {
+			continue
+		}
+		for pvName, pvSpecYaml := range cm.Data {
+			var pvSpec corev1.PersistentVolumeSpec
+			if err := yaml.Unmarshal([]byte(pvSpecYaml), &pvSpec); err != nil {
+				continue
+			}
+			if pvSpec.ClaimRef == nil {
+				continue
+			}
+			pvcNamespace := pvSpec.ClaimRef.Namespace
+			pvcName := pvSpec.ClaimRef.Name
 
-		time.Sleep(retryInterval)
+			err := c.deleteOrphanPVResources(ctx, cluster, pvcNamespace, pvcName, pvName)
+			if err != nil {
+				klog.Warningf("❌ Failed to delete orphan PV/PVC for cluster %s: %v", cluster, err)
+			} else {
+				klog.Infof("🧹 Successfully deleted orphan PV %s and PVC %s/%s from cluster %s",
+					pvName, pvcNamespace, pvcName, cluster)
+			}
+		}
+	}
+	return nil
+}
+func (c *PVMigrationController) deleteOrphanPVResources(ctx context.Context, clusterName, pvcNamespace, pvcName, pvName string,) error {
+	// 1. 멤버 클러스터에 대한 dynamic client 생성
+	dynamicClient, err := util.NewClusterDynamicClientSet(clusterName, c.Client)
+	if err != nil {
+		klog.Errorf("❌ Failed to create dynamic client for cluster %s: %v", clusterName, err)
+		return err
 	}
 
-	// ✅ 모든 PV 준비 완료 후 suspension 해제
-	if rb.Spec.Suspension != nil && rb.Spec.Suspension.Dispatching != nil && *rb.Spec.Suspension.Dispatching {
-		err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-			freshRB := &workv1alpha2.ResourceBinding{}
-			if err := c.Client.Get(ctx, client.ObjectKeyFromObject(rb), freshRB); err != nil {
-				klog.Errorf("❌ Failed to get fresh ResourceBinding: %v", err)
-				return err
-			}
-			if freshRB.Spec.Suspension == nil {
-				freshRB.Spec.Suspension = &workv1alpha2.Suspension{}
-			}
-			falseVal := false
-			freshRB.Spec.Suspension.Dispatching = &falseVal
-			if err := c.Client.Update(ctx, freshRB); err != nil {
-				klog.Warningf("❌ Failed to update suspension.dispatching: %v", err)
-				return err
-			}
-			return nil
-		})
-		if err != nil {
-			klog.Warningf("❌ Still failed to update suspension.dispatching after retries: %v", err)
-			return err
-		}
-		klog.Infof("🎯 Successfully updated suspension.dispatching to false after all PVs became ready")
+	// 2. PVC 삭제
+	pvcRes := schema.GroupVersionResource{Group: "", Version: "v1", Resource: "persistentvolumeclaims"}
+	errPVC := dynamicClient.DynamicClientSet.Resource(pvcRes).Namespace(pvcNamespace).
+		Delete(ctx, pvcName, metav1.DeleteOptions{})
+	if errPVC != nil {
+		klog.Warningf("⚠️ Failed to delete PVC %s/%s from cluster %s: %v", pvcNamespace, pvcName, clusterName, errPVC)
+	} else {
+		klog.Infof("🧹 Deleted PVC %s/%s from cluster %s", pvcNamespace, pvcName, clusterName)
+	}
+
+	// 3. PV 삭제
+	pvRes := schema.GroupVersionResource{Group: "", Version: "v1", Resource: "persistentvolumes"}
+	errPV := dynamicClient.DynamicClientSet.Resource(pvRes).
+		Delete(ctx, pvName, metav1.DeleteOptions{})
+	if errPV != nil {
+		klog.Warningf("⚠️ Failed to delete PV %s from cluster %s: %v", pvName, clusterName, errPV)
+	} else {
+		klog.Infof("🧹 Deleted PV %s from cluster %s", pvName, clusterName)
 	}
 
 	return nil
 }
-
 func (c *PVMigrationController) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		Named(PVMigrationControllerName).
 		For(&workv1alpha2.ResourceBinding{}). // no predicate, triggers on create/update
 		Complete(c)
 }
-
-
-
 
 

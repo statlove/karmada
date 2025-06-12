@@ -224,21 +224,29 @@ func (c *PVMigrationController) createPVWork(ctx context.Context, clusterName st
 	return nil
 }
 func (c *PVMigrationController) finalizeFailoverIfReady(ctx context.Context, rb *workv1alpha2.ResourceBinding) error {
-	const retryInterval = 1 * time.Second
-
 	for {
+		select {
+		case <-ctx.Done():
+			klog.Warningf("❌ Context cancelled before PVs became ready for RB %s/%s", rb.Namespace, rb.Name)
+			return ctx.Err()
+		default:
+			// 계속 진행
+		}
+
 		pvWorkList := &workv1alpha1.WorkList{}
 		if err := c.Client.List(ctx, pvWorkList, client.MatchingLabels{
 			"pvsync.karmada.io/type":      "pv-deployment",
 			"pvsync.karmada.io/source-rb": rb.Name,
 		}); err != nil {
-			return fmt.Errorf("failed to list PV Works: %w", err)
+			klog.Errorf("❌ Failed to list PV Works: %v", err)
+			return err
 		}
 
-		expectedCount := len(pvWorkList.Items)
-		if expectedCount == 0 {
-			klog.Infof("🚫 No PV Works found for RB %s/%s. Skipping suspension finalize.", rb.Namespace, rb.Name)
-			return nil
+		totalCount := len(pvWorkList.Items)
+		if totalCount == 0 {
+			klog.Infof("🚫 No PV Works found for RB %s/%s. Retrying...", rb.Namespace, rb.Name)
+			time.Sleep(1 * time.Second)
+			continue
 		}
 
 		var availableCount int
@@ -250,27 +258,24 @@ func (c *PVMigrationController) finalizeFailoverIfReady(ctx context.Context, rb 
 			go func(pvWork workv1alpha1.Work) {
 				defer wg.Done()
 
-				klog.Infof("🔍 Checking PV Work: %s/%s", pvWork.Namespace, pvWork.Name)
-
 				latest := &workv1alpha1.Work{}
 				if err := c.Client.Get(ctx, client.ObjectKeyFromObject(&pvWork), latest); err != nil {
-					klog.Warningf("⚠️ Failed to re-fetch PV Work %s: %v", pvWork.Name, err)
+					klog.Warningf("⚠️ Failed to get Work %s: %v", pvWork.Name, err)
 					return
 				}
 
 				for _, m := range latest.Status.ManifestStatuses {
-					if m.Identifier.Kind != "PersistentVolume" || m.Health != "Healthy" {
+					if m.Identifier.Kind != "PersistentVolume" {
 						continue
 					}
 					var phaseStruct struct {
 						Phase string `json:"phase"`
 					}
 					if err := json.Unmarshal(m.Status.Raw, &phaseStruct); err != nil {
-						klog.Warningf("⚠️ Failed to parse phase for %s: %v", m.Identifier.Name, err)
+						klog.Warningf("⚠️ Failed to parse PV status for %s: %v", m.Identifier.Name, err)
 						continue
 					}
-					klog.Infof("➡️  PV %s phase = %s", m.Identifier.Name, phaseStruct.Phase)
-					if phaseStruct.Phase == "Available" || phaseStruct.Phase == "Bound" {
+					if phaseStruct.Phase == "Available" {
 						mu.Lock()
 						availableCount++
 						mu.Unlock()
@@ -282,21 +287,21 @@ func (c *PVMigrationController) finalizeFailoverIfReady(ctx context.Context, rb 
 
 		wg.Wait()
 
-		klog.Infof("✅ Available PVs: %d / %d", availableCount, expectedCount)
+		klog.Infof("✅ Available PVs: %d / %d", availableCount, totalCount)
 
-		if availableCount == expectedCount {
+		if availableCount == totalCount {
 			break
 		}
 
-		time.Sleep(retryInterval)
+		time.Sleep(1 * time.Second)
 	}
 
-	// ✅ 모든 PV 준비 완료 후 suspension 해제
+	// 모든 PV 준비 완료 후 suspension.dispatching 해제
 	if rb.Spec.Suspension != nil && rb.Spec.Suspension.Dispatching != nil && *rb.Spec.Suspension.Dispatching {
 		err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 			freshRB := &workv1alpha2.ResourceBinding{}
 			if err := c.Client.Get(ctx, client.ObjectKeyFromObject(rb), freshRB); err != nil {
-				klog.Errorf("❌ Failed to get fresh ResourceBinding: %v", err)
+				klog.Errorf("❌ Failed to re-fetch ResourceBinding: %v", err)
 				return err
 			}
 			if freshRB.Spec.Suspension == nil {
@@ -311,10 +316,10 @@ func (c *PVMigrationController) finalizeFailoverIfReady(ctx context.Context, rb 
 			return nil
 		})
 		if err != nil {
-			klog.Warningf("❌ Still failed to update suspension.dispatching after retries: %v", err)
+			klog.Warningf("❌ Suspension update failed after PV readiness: %v", err)
 			return err
 		}
-		klog.Infof("🎯 Successfully updated suspension.dispatching to false after all PVs became ready")
+		klog.Infof("🎯 Suspension dispatching cleared after all PVs became Available")
 	}
 
 	return nil

@@ -3,8 +3,6 @@ import (
 	"context"
 	"fmt"
 	"sync"
-	"time"
-	"encoding/json"
 	"crypto/sha1"
 	"encoding/hex"
 	corev1 "k8s.io/api/core/v1"
@@ -224,97 +222,97 @@ func (c *PVMigrationController) createPVWork(ctx context.Context, clusterName st
 	return nil
 }
 func (c *PVMigrationController) finalizeFailoverIfReady(ctx context.Context, rb *workv1alpha2.ResourceBinding) error {
-	const retryInterval = 1 * time.Second
-
-	for {
-		pvWorkList := &workv1alpha1.WorkList{}
-		if err := c.Client.List(ctx, pvWorkList, client.MatchingLabels{
-			"pvsync.karmada.io/type":      "pv-deployment",
-			"pvsync.karmada.io/source-rb": rb.Name,
-		}); err != nil {
-			return fmt.Errorf("failed to list PV Works: %w", err)
-		}
-
-		expectedCount := len(pvWorkList.Items)
-		if expectedCount == 0 {
-			klog.Infof("🚫 No PV Works found for RB %s/%s. Skipping suspension finalize.", rb.Namespace, rb.Name)
-			return nil
-		}
-
-		var availableCount int
-		var mu sync.Mutex
-		var wg sync.WaitGroup
-
-		for _, pvWork := range pvWorkList.Items {
-			wg.Add(1)
-			go func(pvWork workv1alpha1.Work) {
-				defer wg.Done()
-
-				klog.Infof("🔍 Checking PV Work: %s/%s", pvWork.Namespace, pvWork.Name)
-
-				latest := &workv1alpha1.Work{}
-				if err := c.Client.Get(ctx, client.ObjectKeyFromObject(&pvWork), latest); err != nil {
-					klog.Warningf("⚠️ Failed to re-fetch PV Work %s: %v", pvWork.Name, err)
-					return
-				}
-
-				for _, m := range latest.Status.ManifestStatuses {
-					if m.Identifier.Kind != "PersistentVolume" || m.Health != "Healthy" {
-						continue
-					}
-					var phaseStruct struct {
-						Phase string `json:"phase"`
-					}
-					if err := json.Unmarshal(m.Status.Raw, &phaseStruct); err != nil {
-						klog.Warningf("⚠️ Failed to parse phase for %s: %v", m.Identifier.Name, err)
-						continue
-					}
-					klog.Infof("➡️  PV %s phase = %s", m.Identifier.Name, phaseStruct.Phase)
-					if phaseStruct.Phase == "Available" || phaseStruct.Phase == "Bound" {
-						mu.Lock()
-						availableCount++
-						mu.Unlock()
-						break
-					}
-				}
-			}(pvWork)
-		}
-
-		wg.Wait()
-
-		klog.Infof("✅ Available PVs: %d / %d", availableCount, expectedCount)
-
-		if availableCount == expectedCount {
-			break
-		}
-
-		time.Sleep(retryInterval)
+	freshPVWorkList := &workv1alpha1.WorkList{}
+	if err := c.Client.List(ctx, freshPVWorkList, client.MatchingLabels{
+		"pvsync.karmada.io/type":      "pv-deployment",
+		"pvsync.karmada.io/source-rb": rb.Name,
+	}); err != nil {
+		return fmt.Errorf("failed to list PV Works: %w", err)
 	}
 
-	// ✅ 모든 PV 준비 완료 후 suspension 해제
-	if rb.Spec.Suspension != nil && rb.Spec.Suspension.Dispatching != nil && *rb.Spec.Suspension.Dispatching {
-		err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-			freshRB := &workv1alpha2.ResourceBinding{}
-			if err := c.Client.Get(ctx, client.ObjectKeyFromObject(rb), freshRB); err != nil {
-				klog.Errorf("❌ Failed to get fresh ResourceBinding: %v", err)
-				return err
-			}
-			if freshRB.Spec.Suspension == nil {
-				freshRB.Spec.Suspension = &workv1alpha2.Suspension{}
-			}
-			falseVal := false
-			freshRB.Spec.Suspension.Dispatching = &falseVal
-			if err := c.Client.Update(ctx, freshRB); err != nil {
-				klog.Warningf("❌ Failed to update suspension.dispatching: %v", err)
-				return err
-			}
-			return nil
-		})
-		if err != nil {
-			klog.Warningf("❌ Still failed to update suspension.dispatching after retries: %v", err)
-			return err
+	// 1. PV hash 기준으로 중복 제거한 기대 개수 계산
+	pvHashSet := make(map[string]struct{})
+	for _, w := range freshPVWorkList.Items {
+		pvHash := w.Labels["pvsync.karmada.io/source-pv"]
+		if pvHash != "" {
+			pvHashSet[pvHash] = struct{}{}
 		}
-		klog.Infof("🎯 Successfully updated suspension.dispatching to false after all PVs became ready")
+	}
+	expectedCount := len(pvHashSet)
+	klog.Infof("🔄 Unique PV count for readiness check: %d", expectedCount)
+	if expectedCount == 0 {
+		klog.Infof("🚫 No PV Works found for RB %s/%s. Skipping suspension finalize.", rb.Namespace, rb.Name)
+		return nil
+	}
+
+	// 2. 병렬로 PV Healthy 여부 검사
+	var availableCount int
+	var mu sync.Mutex
+	processed := make(map[string]struct{})
+	var wg sync.WaitGroup
+
+	for _, pvWork := range freshPVWorkList.Items {
+		wg.Add(1)
+		go func(pvWork workv1alpha1.Work) {
+			defer wg.Done()
+
+			latest := &workv1alpha1.Work{}
+			if err := c.Client.Get(ctx, client.ObjectKeyFromObject(&pvWork), latest); err != nil {
+				klog.Warningf("Failed to re-fetch PV Work: %v", err)
+				return
+			}
+
+			for _, m := range latest.Status.ManifestStatuses {
+				if m.Identifier.Kind == "PersistentVolume" && m.Health == "Healthy" {
+					pvHash := pvWork.Labels["pvsync.karmada.io/source-pv"]
+					if pvHash == "" {
+						continue
+					}
+
+					mu.Lock()
+					if _, ok := processed[pvHash]; !ok {
+						processed[pvHash] = struct{}{}
+						availableCount++
+					}
+					mu.Unlock()
+					break
+				}
+			}
+		}(pvWork)
+	}
+
+	wg.Wait()
+
+	klog.Infof("✅ Available PVs: %d / %d", availableCount, expectedCount)
+
+	// 3. 준비 완료 시 suspension.dispatching 해제
+	if availableCount == expectedCount {
+		if rb.Spec.Suspension != nil && rb.Spec.Suspension.Dispatching != nil && *rb.Spec.Suspension.Dispatching {
+			err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+				freshRB := &workv1alpha2.ResourceBinding{}
+				if err := c.Client.Get(ctx, client.ObjectKeyFromObject(rb), freshRB); err != nil {
+					klog.Errorf("❌ Failed to get fresh ResourceBinding: %v", err)
+					return err
+				}
+				if freshRB.Spec.Suspension == nil {
+					freshRB.Spec.Suspension = &workv1alpha2.Suspension{}
+				}
+				falseVal := false
+				freshRB.Spec.Suspension.Dispatching = &falseVal
+
+				if err := c.Client.Update(ctx, freshRB); err != nil {
+					klog.Warningf("❌ Failed to update suspension.dispatching (inside retry): %v", err)
+					return err
+				}
+				return nil
+			})
+			if err != nil {
+				klog.Warningf("❌ Still failed to update suspension.dispatching after retries: %v", err)
+				return err
+			} else {
+				klog.Infof("✅ Successfully updated suspension.dispatching to false after retries")
+			}
+		}
 	}
 
 	return nil

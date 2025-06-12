@@ -242,6 +242,7 @@ func init() {
 	controllers["agentcsrapproving"] = startAgentCSRApprovingController
 	controllers["pvSync"] = startPVSyncController //ms: add controller
 	controllers["pvMigration"] = startPVMigrationController //ms: add controller
+	controllers["pvCleanup"] = startPVCleanupController // ms: add controller
 }
 
 func startClusterController(ctx controllerscontext.Context) (enabled bool, err error) {
@@ -781,6 +782,17 @@ func startPVMigrationController(ctx controllerscontext.Context) (enabled bool, e
         return false, err
     }
     return true, nil
+}
+func startPVCleanupController(ctx controllerscontext.Context) (enabled bool, err error) {
+    controller := &pvsync.PVCleanupController{
+	Client:                      ctx.Mgr.GetClient(),
+	RESTMapper:                  ctx.Mgr.GetRESTMapper(),
+	ClusterDynamicClientSetFunc: util.NewClusterDynamicClientSet,
+    }
+    if err := controller.SetupWithManager(ctx.Mgr); err != nil {
+	return false, err
+    }
+	return true, nil
 }
 // setupControllers initialize controllers and setup one by one.
 func setupControllers(mgr controllerruntime.Manager, opts *options.Options, stopChan <-chan struct{}) {

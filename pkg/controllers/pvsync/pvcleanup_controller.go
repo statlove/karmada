@@ -1,0 +1,206 @@
+package pvsync
+
+import (
+	"context"
+	"fmt"
+
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/meta"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/yaml"
+	workv1alpha1 "github.com/karmada-io/karmada/pkg/apis/work/v1alpha1"
+	workv1alpha2 "github.com/karmada-io/karmada/pkg/apis/work/v1alpha2"
+	"github.com/karmada-io/karmada/pkg/util"
+	"github.com/karmada-io/karmada/pkg/util/names"
+
+	"k8s.io/klog/v2"
+)
+
+const rbFinalizer = "pvsync.karmada.io/cleanup"
+
+type PVCleanupController struct {
+	client.Client
+	ClusterDynamicClientSetFunc func(clusterName string, client client.Client) (*util.DynamicClusterClient, error)
+	RESTMapper                  meta.RESTMapper
+}
+
+func (c *PVCleanupController) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+	klog.Infof("[PVCleanupController] Reconciling ResourceBinding %s", req.NamespacedName)
+
+	rb := &workv1alpha2.ResourceBinding{}
+	if err := c.Client.Get(ctx, req.NamespacedName, rb); err != nil {
+		return ctrl.Result{}, client.IgnoreNotFound(err)
+	}
+
+	// Finalizer 등록
+	if !controllerutil.ContainsFinalizer(rb, rbFinalizer) {
+		controllerutil.AddFinalizer(rb, rbFinalizer)
+		if err := c.Client.Update(ctx, rb); err != nil {
+			return ctrl.Result{}, err
+		}
+		klog.Infof("🧷 Added finalizer to RB %s", rb.Name)
+		return ctrl.Result{}, nil
+	}
+
+	// ✅ RB 삭제 중이면 모든 Work 및 관련 PV/PVC 제거
+	if !rb.DeletionTimestamp.IsZero() {
+		klog.Infof("🪦 RB %s is being deleted. Cleaning up all associated resources.", rb.Name)
+
+		workList := &workv1alpha1.WorkList{}
+		_ = c.Client.List(ctx, workList, client.MatchingLabels{
+			"pvsync.karmada.io/source-rb": rb.Name,
+		})
+		for _, work := range workList.Items {
+			clusterName, err := names.GetClusterName(work.Namespace)
+			if err != nil {
+				continue
+			}
+			_ = c.Client.Delete(ctx, &work)
+
+			if work.Labels["pvsync.karmada.io/type"] == "metadata" {
+				_ = c.cleanupOrphanPVs(ctx, clusterName, &work)
+			}
+		}
+
+		// Finalizer 제거
+		controllerutil.RemoveFinalizer(rb, rbFinalizer)
+		if err := c.Client.Update(ctx, rb); err != nil {
+			klog.Errorf("❌ Failed to remove finalizer from RB %s: %v", rb.Name, err)
+			return ctrl.Result{}, err
+		}
+		klog.Infof("✅ Finalizer removed. RB %s will now be deleted.", rb.Name)
+		return ctrl.Result{}, nil
+	}
+
+	// 1. StatefulSet RB만 처리
+	if rb.Spec.Resource.Kind != "StatefulSet" || rb.Spec.Resource.APIVersion != "apps/v1" {
+		return ctrl.Result{}, nil
+	}
+	// 2. gracefulEvictionTasks 없어야 함
+	if len(rb.Spec.GracefulEvictionTasks) > 0 {
+		return ctrl.Result{}, nil
+	}
+	// 3. suspension.dispatching == nil or false
+	if rb.Spec.Suspension != nil && rb.Spec.Suspension.Dispatching != nil && *rb.Spec.Suspension.Dispatching {
+		return ctrl.Result{}, nil
+	}
+
+	stsKey := fmt.Sprintf("%s.%s", rb.Spec.Resource.Namespace, rb.Spec.Resource.Name)
+
+	// 4. 현재 클러스터 집합
+	currentClusters := map[string]bool{}
+	for _, cluster := range rb.Spec.Clusters {
+		currentClusters[cluster.Name] = true
+	}
+
+	// 5. Work 목록 조회 (pv-work, pv-metadata-work 포함)
+	workList := &workv1alpha1.WorkList{}
+	if err := c.Client.List(ctx, workList, client.MatchingLabels{
+		"pvsync.karmada.io/source-sts": stsKey,
+	}); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	for _, work := range workList.Items {
+		clusterName, err := names.GetClusterName(work.Namespace)
+		if err != nil {
+			continue
+		}
+
+		isCurrent := currentClusters[clusterName]
+		labelType := work.Labels["pvsync.karmada.io/type"]
+
+		// ✅ 현재 클러스터라도 pv-work는 삭제 (재배포 목적)
+		if isCurrent && labelType == "pv-deployment" {
+			klog.Infof("🧹 Deleting PV Work %s/%s from current cluster %s", work.Namespace, work.Name, clusterName)
+			_ = c.Client.Delete(ctx, &work)
+			continue
+		}
+
+		if isCurrent {
+			continue // 현재 클러스터이고 metadata인 경우는 남김
+		}
+
+		// ✅ 이전 클러스터에서 pv-work, metadata 모두 삭제
+		klog.Infof("🧹 Deleting Work %s/%s for old cluster %s", work.Namespace, work.Name, clusterName)
+		_ = c.Client.Delete(ctx, &work)
+
+		if labelType == "metadata" {
+			_ = c.cleanupOrphanPVs(ctx, clusterName, &work)
+		}
+	}
+
+	return ctrl.Result{}, nil
+}
+func (c *PVCleanupController) cleanupOrphanPVs(ctx context.Context, cluster string, work *workv1alpha1.Work) error {
+	for _, manifest := range work.Spec.Workload.Manifests {
+		var cm corev1.ConfigMap
+		if err := yaml.Unmarshal(manifest.Raw, &cm); err != nil {
+			continue
+		}
+		for pvName, pvSpecYaml := range cm.Data {
+			var pvSpec corev1.PersistentVolumeSpec
+			if err := yaml.Unmarshal([]byte(pvSpecYaml), &pvSpec); err != nil {
+				continue
+			}
+			if pvSpec.ClaimRef == nil {
+				continue
+			}
+			pvcNamespace := pvSpec.ClaimRef.Namespace
+			pvcName := pvSpec.ClaimRef.Name
+
+			err := c.deleteOrphanPVResources(ctx, cluster, pvcNamespace, pvcName, pvName)
+			if err != nil {
+				klog.Warningf("❌ Failed to delete orphan PV/PVC for cluster %s: %v", cluster, err)
+			} else {
+				klog.Infof("🧹 Successfully deleted orphan PV %s and PVC %s/%s from cluster %s",
+					pvName, pvcNamespace, pvcName, cluster)
+			}
+		}
+	}
+	return nil
+}
+
+func (c *PVCleanupController) deleteOrphanPVResources(ctx context.Context, clusterName, pvcNamespace, pvcName, pvName string) error {
+	dynamicClient, err := util.NewClusterDynamicClientSet(clusterName, c.Client)
+	if err != nil {
+		klog.Errorf("❌ Failed to create dynamic client for cluster %s: %v", clusterName, err)
+		return err
+	}
+
+	// PVC 삭제
+	pvcRes := schema.GroupVersionResource{Group: "", Version: "v1", Resource: "persistentvolumeclaims"}
+	errPVC := dynamicClient.DynamicClientSet.Resource(pvcRes).Namespace(pvcNamespace).
+		Delete(ctx, pvcName, metav1.DeleteOptions{})
+	if errPVC != nil {
+		klog.Warningf("⚠️ Failed to delete PVC %s/%s from cluster %s: %v", pvcNamespace, pvcName, clusterName, errPVC)
+	} else {
+		klog.Infof("🧹 Deleted PVC %s/%s from cluster %s", pvcNamespace, pvcName, clusterName)
+	}
+
+	// PV 삭제
+	pvRes := schema.GroupVersionResource{Group: "", Version: "v1", Resource: "persistentvolumes"}
+	errPV := dynamicClient.DynamicClientSet.Resource(pvRes).
+		Delete(ctx, pvName, metav1.DeleteOptions{})
+	if errPV != nil {
+		klog.Warningf("⚠️ Failed to delete PV %s from cluster %s: %v", pvName, clusterName, errPV)
+	} else {
+		klog.Infof("🧹 Deleted PV %s from cluster %s", pvName, clusterName)
+	}
+
+	return nil
+}
+
+func (c *PVCleanupController) SetupWithManager(mgr ctrl.Manager) error {
+	return ctrl.NewControllerManagedBy(mgr).
+		Named("pv-cleanup-controller").
+		For(&workv1alpha2.ResourceBinding{}).
+		Complete(c)
+}
+
+
+
